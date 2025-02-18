@@ -24,7 +24,17 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
-import face_recognition  # Add this to requirements.txt
+import face_recognition
+from deepface import DeepFace
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import threading
+from sklearn.preprocessing import normalize
+import gdown  # Add this to requirements.txt
+import hashlib
+import face_alignment
+from face_alignment import LandmarksType
+import math
+from scipy.spatial.distance import cdist
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -72,436 +82,297 @@ if torch.cuda.is_available():
     resnet = resnet.cuda()
 
 @dataclass
-class FaceInstance:
+class FaceSignature:
+    embedding: np.ndarray      # Combined embedding
     filename: str
-    face_index: int
-    box: List[float]
+    face_image: str
     confidence: float
-    embedding: np.ndarray
-    face_image: str  # base64 encoded image
+    box: List[float]
 
-@dataclass
-class FacialFeatures:
-    landmarks: Dict[str, List[float]]  # Facial landmarks
-    pose: Dict[str, float]  # Head pose estimation
-    attributes: Dict[str, float]  # Age, gender, expression etc.
+    def __post_init__(self):
+        """Normalize and validate all features"""
+        self.confidence = float(self.confidence)
+        self.box = [float(x) for x in self.box]
+        self.embedding = normalize(np.asarray(self.embedding).reshape(1, -1))[0]
 
-class EnhancedFaceClusterer:
-    def __init__(
-        self,
-        min_face_size: int = 160,
-        min_confidence: float = 0.92,
-        similarity_threshold: float = 0.7,
-        min_cluster_size: int = 2
-    ):
-        self.min_face_size = min_face_size
-        self.min_confidence = min_confidence
-        self.similarity_threshold = similarity_threshold
-        self.min_cluster_size = min_cluster_size
-        self.face_instances = []
-        self.embeddings = []
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, FaceSignature):
+            return False
+        return (self.filename == other.filename and 
+                np.array_equal(self.box, other.box))
+
+    def __hash__(self) -> int:
+        return hash((self.filename, tuple(self.box)))
+
+class RobustFaceClusterer:
+    def __init__(self):
+        self.face_signatures: List[FaceSignature] = []
+        self.min_confidence = 0.92
+        self.cache_file = "face_embeddings_cache.json"
+        self.cache_lock = threading.Lock()
+        self.batch_size = 32
+        self.padding_factor = 0.15
+        self.verification_threshold = 0.65
         
-    def _extract_facial_features(self, face_img: np.ndarray) -> Optional[FacialFeatures]:
-        """Extract additional facial features using face_recognition"""
-        try:
-            # Convert to RGB if needed
-            if len(face_img.shape) == 2:
-                face_img = cv2.cvtColor(face_img, cv2.COLOR_GRAY2RGB)
-            elif face_img.shape[2] == 4:
-                face_img = cv2.cvtColor(face_img, cv2.COLOR_RGBA2RGB)
-            
-            # Get face landmarks
-            face_landmarks = face_recognition.face_landmarks(face_img)
-            if not face_landmarks:
-                return None
-                
-            landmarks = face_landmarks[0]
-            
-            # Calculate basic pose estimation from landmarks
-            left_eye = np.mean(landmarks['left_eye'], axis=0)
-            right_eye = np.mean(landmarks['right_eye'], axis=0)
-            nose_tip = landmarks['nose_bridge'][-1]
-            
-            # Calculate head pose
-            eye_angle = np.degrees(np.arctan2(
-                right_eye[1] - left_eye[1],
-                right_eye[0] - left_eye[0]
-            ))
-            
-            # Estimate face orientation
-            face_direction = np.array(nose_tip) - np.mean([left_eye, right_eye], axis=0)
-            face_angle = np.degrees(np.arctan2(face_direction[1], face_direction[0]))
-            
-            return FacialFeatures(
-                landmarks=landmarks,
-                pose={
-                    'eye_angle': float(eye_angle),
-                    'face_angle': float(face_angle)
-                },
-                attributes={}  # Placeholder for additional attributes
-            )
-            
-        except Exception as e:
-            logger.error(f"Error extracting facial features: {str(e)}")
-            return None
+        # Initialize models
+        logger.info("Initializing face recognition models...")
+        self.model = DeepFace.build_model("Facenet")
+        
+        # Simpler face alignment initialization
+        self.fa = face_alignment.FaceAlignment(
+            2,  # Using integer value instead of enum
+            flip_input=False,
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        logger.info(f"Models initialized successfully on {'GPU' if torch.cuda.is_available() else 'CPU'}")
+        
+        self._load_cache()
 
-    def _compute_feature_similarity(
-        self,
-        features1: FacialFeatures,
-        features2: FacialFeatures
-    ) -> float:
-        """Compute similarity based on facial features"""
+    def _load_cache(self):
+        """Load cached embeddings"""
         try:
-            # Compare landmark configurations
-            landmark_similarity = 0
-            for key in features1.landmarks.keys():
-                points1 = np.array(features1.landmarks[key])
-                points2 = np.array(features2.landmarks[key])
-                
-                # Normalize coordinates
-                points1 = (points1 - np.mean(points1, axis=0)) / np.std(points1)
-                points2 = (points2 - np.mean(points2, axis=0)) / np.std(points2)
-                
-                # Compute similarity
-                landmark_similarity += 1 - np.mean(np.abs(points1 - points2))
-                
-            landmark_similarity /= len(features1.landmarks)
-            
-            # Compare pose angles
-            pose_similarity = 1 - (
-                abs(features1.pose['eye_angle'] - features2.pose['eye_angle']) / 180 +
-                abs(features1.pose['face_angle'] - features2.pose['face_angle']) / 180
-            ) / 2
-            
-            return 0.7 * landmark_similarity + 0.3 * pose_similarity
-            
-        except Exception as e:
-            logger.error(f"Error computing feature similarity: {str(e)}")
-            return 0.0
-
-    def _compute_hybrid_similarity(
-        self,
-        idx1: int,
-        idx2: int,
-        embedding_similarities: np.ndarray
-    ) -> float:
-        """Compute hybrid similarity using both embeddings and facial features"""
-        try:
-            # Get base similarity from embeddings
-            emb_similarity = embedding_similarities[idx1, idx2]
-            
-            # Get facial features similarity
-            face1 = self.face_instances[idx1]
-            face2 = self.face_instances[idx2]
-            
-            if hasattr(face1, 'facial_features') and hasattr(face2, 'facial_features'):
-                feature_similarity = self._compute_feature_similarity(
-                    face1.facial_features,
-                    face2.facial_features
-                )
+            if Path(self.cache_file).exists():
+                with open(self.cache_file, 'r') as f:
+                    self.embedding_cache = json.load(f)
+                logger.info(f"Loaded {len(self.embedding_cache)} cached embeddings")
             else:
-                feature_similarity = 0.5  # Neutral if features not available
-            
-            # Combine similarities with weights
-            return 0.6 * emb_similarity + 0.4 * feature_similarity
-            
+                self.embedding_cache = {}
         except Exception as e:
-            logger.error(f"Error computing hybrid similarity: {str(e)}")
-            return 0.0
+            logger.error(f"Error loading cache: {str(e)}")
+            self.embedding_cache = {}
 
-    def _hierarchical_clustering(
-        self,
-        similarity_matrix: np.ndarray
-    ) -> np.ndarray:
-        """Perform hierarchical clustering with dynamic threshold"""
+    def _save_cache(self):
+        """Save embeddings to cache"""
         try:
-            # Convert similarity to distance
-            distance_matrix = 1 - similarity_matrix
+            with self.cache_lock:
+                with open(self.cache_file, 'w') as f:
+                    json.dump(self.embedding_cache, f)
+        except Exception as e:
+            logger.error(f"Error saving cache: {str(e)}")
+
+    def _get_image_hash(self, image_path: str) -> str:
+        """Get MD5 hash of image file"""
+        try:
+            with open(image_path, 'rb') as f:
+                return hashlib.md5(f.read()).hexdigest()
+        except Exception as e:
+            logger.error(f"Error hashing image {image_path}: {str(e)}")
+            return ""
+
+    def _align_face(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Align face using modern face alignment"""
+        try:
+            # Convert BGR to RGB if needed
+            if len(image.shape) == 3 and image.shape[2] == 3:
+                if isinstance(image, np.ndarray):
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    image_rgb = image
+            else:
+                image_rgb = image
+
+            # Get landmarks
+            landmarks = self.fa.get_landmarks(image_rgb)
             
-            # Perform hierarchical clustering
-            linkage_matrix = linkage(
-                distance_matrix[np.triu_indices(len(distance_matrix), k=1)],
-                method='complete'
+            if landmarks is None or len(landmarks) == 0:
+                logger.warning("No landmarks detected")
+                return image, None
+
+            landmarks = landmarks[0]  # Get first face landmarks
+
+            # Get eye coordinates
+            left_eye = landmarks[36:42].mean(axis=0)
+            right_eye = landmarks[42:48].mean(axis=0)
+            
+            # Calculate angle for alignment
+            dx = right_eye[0] - left_eye[0]
+            dy = right_eye[1] - left_eye[1]
+            angle = math.degrees(math.atan2(dy, dx))
+            
+            # Get center of face
+            center = ((left_eye + right_eye) / 2).astype(int)
+            
+            # Create rotation matrix
+            M = cv2.getRotationMatrix2D(tuple(center), angle, 1)
+            
+            # Perform rotation
+            aligned = cv2.warpAffine(
+                image, 
+                M, 
+                (image.shape[1], image.shape[0]),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_REPLICATE
             )
             
-            # Find optimal number of clusters using elbow method
-            last = linkage_matrix[-10:, 2]
-            acceleration = np.diff(last, 2)
-            k = acceleration.argmax() + 2
-            k = max(k, self.min_cluster_size)
+            # Rotate landmarks too
+            ones = np.ones(shape=(len(landmarks), 1))
+            points_ones = np.hstack([landmarks, ones])
+            transformed_landmarks = M.dot(points_ones.T).T
             
-            # Get cluster labels
-            labels = fcluster(linkage_matrix, k, criterion='maxclust')
-            return labels - 1  # Convert to 0-based indexing
+            return aligned, transformed_landmarks
             
         except Exception as e:
-            logger.error(f"Error in hierarchical clustering: {str(e)}")
-            return np.array([-1] * len(similarity_matrix))
+            logger.error(f"Error in face alignment: {str(e)}")
+            return image, None
 
-    def _compute_cluster_quality(
-        self,
-        cluster_faces: List[FaceInstance],
-        similarity_matrix: np.ndarray
-    ) -> float:
-        """Compute the quality score for a cluster"""
+    def _get_face_region(self, image: np.ndarray, box: List[float]) -> np.ndarray:
+        """Extract and align face region"""
         try:
-            if len(cluster_faces) < 2:
-                return 0.0
+            h, w = image.shape[:2]
+            x1, y1, x2, y2 = map(int, box)
             
-            # Get indices of faces in this cluster
-            face_indices = [
-                i for i, face in enumerate(self.face_instances)
-                if face in cluster_faces
-            ]
+            # Calculate padding
+            width = x2 - x1
+            height = y2 - y1
+            padding_w = int(width * self.padding_factor)
+            padding_h = int(height * self.padding_factor)
             
-            # Extract similarity submatrix for this cluster
-            cluster_similarities = similarity_matrix[np.ix_(face_indices, face_indices)]
+            # Apply padding with bounds checking
+            x1 = max(0, x1 - padding_w)
+            y1 = max(0, y1 - padding_h)
+            x2 = min(w, x2 + padding_w)
+            y2 = min(h, y2 + padding_h)
             
-            # Compute various quality metrics
-            # 1. Average pairwise similarity
-            np.fill_diagonal(cluster_similarities, 0)  # Exclude self-similarities
-            avg_similarity = np.mean(cluster_similarities)
+            # Extract face region
+            face_region = image[y1:y2, x1:x2]
             
-            # 2. Minimum pairwise similarity
-            min_similarity = np.min(cluster_similarities[cluster_similarities > 0])
+            # Align face
+            aligned_face, landmarks = self._align_face(face_region)
             
-            # 3. Consistency score (how many pairs are above threshold)
-            pairs_above_threshold = np.sum(cluster_similarities > self.similarity_threshold)
-            total_pairs = (len(cluster_faces) * (len(cluster_faces) - 1)) / 2
-            consistency_score = pairs_above_threshold / total_pairs
+            if landmarks is not None:
+                # Get face bounding box from landmarks
+                min_x, min_y = np.min(landmarks, axis=0)
+                max_x, max_y = np.max(landmarks, axis=0)
+                
+                # Add small margin
+                margin = 0.1
+                bbox_w = max_x - min_x
+                bbox_h = max_y - min_y
+                min_x = max(0, min_x - bbox_w * margin)
+                min_y = max(0, min_y - bbox_h * margin)
+                max_x = min(aligned_face.shape[1], max_x + bbox_w * margin)
+                max_y = min(aligned_face.shape[0], max_y + bbox_h * margin)
+                
+                # Crop to aligned landmarks
+                aligned_face = aligned_face[int(min_y):int(max_y), int(min_x):int(max_x)]
             
-            # 4. Average face confidence
-            avg_confidence = np.mean([face.confidence for face in cluster_faces])
-            
-            # 5. Facial features consistency (if available)
-            feature_consistency = 0.0
-            feature_count = 0
-            
-            for face in cluster_faces:
-                if hasattr(face, 'facial_features'):
-                    feature_count += 1
-            
-            if feature_count >= 2:
-                feature_similarities = []
-                for i, face1 in enumerate(cluster_faces[:-1]):
-                    for face2 in cluster_faces[i+1:]:
-                        if hasattr(face1, 'facial_features') and hasattr(face2, 'facial_features'):
-                            sim = self._compute_feature_similarity(
-                                face1.facial_features,
-                                face2.facial_features
-                            )
-                            feature_similarities.append(sim)
-            
-            if feature_similarities:
-                feature_consistency = np.mean(feature_similarities)
-            
-            # Combine all metrics with weights
-            quality_score = (
-                0.3 * avg_similarity +
-                0.2 * min_similarity +
-                0.2 * consistency_score +
-                0.15 * avg_confidence +
-                0.15 * feature_consistency
-            )
-            
-            return float(quality_score)
+            return aligned_face
             
         except Exception as e:
-            logger.error(f"Error computing cluster quality: {str(e)}")
-            return 0.0
+            logger.error(f"Error extracting face region: {str(e)}")
+            return image[y1:y2, x1:x2]
 
-    def _select_representative_face(self, cluster_faces: List[FaceInstance]) -> FaceInstance:
-        """Select the best representative face from a cluster using multiple criteria"""
+    def embed_faces_batch(self, face_images: List[np.ndarray]) -> List[np.ndarray]:
+        """Process faces in batches with alignment"""
         try:
-            if not cluster_faces:
-                return None
-            
-            face_scores = []
-            for face in cluster_faces:
-                score = 0.0
-                
-                # 1. Base confidence score (30%)
-                score += 0.3 * face.confidence
-                
-                # 2. Face position and size score (25%)
-                box = face.box
-                width = box[2] - box[0]
-                height = box[3] - box[1]
-                size = width * height
-                
-                # Prefer centered faces
-                center_x = (box[0] + box[2]) / 2
-                center_y = (box[1] + box[3]) / 2
-                center_offset = abs(0.5 - center_x) + abs(0.5 - center_y)
-                position_score = 1 - (center_offset / 2)
-                
-                # Prefer larger faces, but not too large
-                size_score = min(1.0, size / (self.min_face_size ** 2))
-                
-                score += 0.25 * (0.6 * position_score + 0.4 * size_score)
-                
-                # 3. Facial features quality score (25%)
-                if hasattr(face, 'facial_features'):
-                    feature_score = 0.0
-                    
-                    # Check if eyes are open and visible
-                    if 'left_eye' in face.facial_features.landmarks and 'right_eye' in face.facial_features.landmarks:
-                        left_eye = np.array(face.facial_features.landmarks['left_eye'])
-                        right_eye = np.array(face.facial_features.landmarks['right_eye'])
-                        
-                        # Check eye aspect ratio
-                        left_ear = self._eye_aspect_ratio(left_eye)
-                        right_ear = self._eye_aspect_ratio(right_eye)
-                        eye_score = min(1.0, (left_ear + right_ear) / 0.5)
-                        feature_score += 0.4 * eye_score
-                    
-                    # Check face angle
-                    pose = face.facial_features.pose
-                    angle_penalty = 1.0 - (abs(pose['face_angle']) / 45.0)  # Penalize angles > 45 degrees
-                    feature_score += 0.6 * max(0, angle_penalty)
-                    
-                    score += 0.25 * feature_score
-                
-                # 4. Similarity to cluster center score (20%)
-                face_idx = self.face_instances.index(face)
-                cluster_indices = [self.face_instances.index(f) for f in cluster_faces]
-                similarities = [
-                    1 - cosine(self.embeddings[face_idx], self.embeddings[i])
-                    for i in cluster_indices
-                ]
-                center_similarity = np.mean(similarities)
-                score += 0.2 * center_similarity
-                
-                face_scores.append(score)
-            
-            # Select face with highest score
-            best_idx = np.argmax(face_scores)
-            return cluster_faces[best_idx]
-            
-        except Exception as e:
-            logger.error(f"Error selecting representative face: {str(e)}")
-            # Fallback to highest confidence face
-            return max(cluster_faces, key=lambda x: x.confidence)
+            if not face_images:
+                return []
 
-    def _eye_aspect_ratio(self, eye_points: np.ndarray) -> float:
-        """Calculate eye aspect ratio to detect open eyes"""
-        try:
-            # Compute the euclidean distances
-            vertical_1 = np.linalg.norm(eye_points[1] - eye_points[5])
-            vertical_2 = np.linalg.norm(eye_points[2] - eye_points[4])
-            horizontal = np.linalg.norm(eye_points[0] - eye_points[3])
-            
-            # Compute eye aspect ratio
-            ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
-            return float(ear)
-            
-        except Exception as e:
-            logger.error(f"Error calculating eye aspect ratio: {str(e)}")
-            return 0.0
+            # Preprocess and align faces
+            preprocessed = []
+            for face in face_images:
+                # Align face
+                aligned_face, _ = self._align_face(face)
+                
+                # Resize and normalize
+                face_resized = cv2.resize(aligned_face, (160, 160))
+                face_pixels = face_resized.astype('float32')
+                mean, std = face_pixels.mean(), face_pixels.std()
+                face_pixels = (face_pixels - mean) / std
+                preprocessed.append(np.expand_dims(face_pixels, axis=0))
 
-    def cluster_faces(self) -> List[Dict[str, Any]]:
-        """Perform enhanced face clustering"""
-        if len(self.face_instances) < self.min_cluster_size:
+            # Process in batches
+            embeddings = []
+            for i in range(0, len(preprocessed), self.batch_size):
+                batch = preprocessed[i:i + self.batch_size]
+                batch = np.vstack(batch)
+                batch_embeddings = self.model.predict(batch, verbose=0)
+                embeddings.extend(batch_embeddings)
+
+            return embeddings
+
+        except Exception as e:
+            logger.error(f"Error in batch embedding: {str(e)}")
             return []
-            
+
+    def get_unique_people(self) -> List[Dict[str, Any]]:
+        """Get unique people with improved cluster verification"""
         try:
-            # Compute embedding similarities
-            embeddings_array = np.array(self.embeddings)
-            embedding_similarities = 1 - np.array([
-                [cosine(emb1, emb2) for emb2 in embeddings_array]
-                for emb1 in embeddings_array
-            ])
-            
-            # Compute hybrid similarity matrix
-            n_faces = len(self.face_instances)
-            hybrid_similarities = np.zeros((n_faces, n_faces))
-            
-            for i in range(n_faces):
-                for j in range(i + 1, n_faces):
-                    similarity = self._compute_hybrid_similarity(
-                        i, j, embedding_similarities
-                    )
-                    hybrid_similarities[i, j] = similarity
-                    hybrid_similarities[j, i] = similarity
-            
-            # Perform hierarchical clustering
-            cluster_labels = self._hierarchical_clustering(hybrid_similarities)
-            
-            # Group faces by cluster
-            clusters = {}
-            for idx, label in enumerate(cluster_labels):
-                if label >= 0:
-                    if label not in clusters:
-                        clusters[label] = []
-                    clusters[label].append(self.face_instances[idx])
-            
-            # Process clusters
+            if not self.face_signatures:
+                return []
+
+            # Get embeddings
+            embeddings = np.array([face.embedding for face in self.face_signatures])
+
+            # Initial clustering
+            clustering = DBSCAN(
+                eps=0.4,
+                min_samples=2,
+                metric='cosine',
+                n_jobs=-1
+            ).fit(embeddings)
+
+            # Group faces
+            initial_groups = defaultdict(list)
+            for face, label in zip(self.face_signatures, clustering.labels_):
+                if label != -1:
+                    initial_groups[label].append(face)
+
+            # Verify and refine clusters
+            verified_groups = []
+            for group in initial_groups.values():
+                if len(group) < 2:
+                    continue
+
+                # Find centroid face (most confident)
+                centroid = max(group, key=lambda x: float(x.confidence))
+                centroid_embedding = centroid.embedding
+
+                # Verify each face against centroid
+                verified_faces = []
+                for face in group:
+                    # Calculate cosine similarity
+                    similarity = 1 - cosine(centroid_embedding, face.embedding)
+                    
+                    if similarity >= self.verification_threshold:
+                        verified_faces.append(face)
+                    else:
+                        logger.info(f"Removing face from cluster: similarity {similarity:.3f}")
+
+                if len(verified_faces) >= 2:
+                    verified_groups.append(verified_faces)
+
+            # Format output
             unique_people = []
-            for cluster_id, cluster_faces in clusters.items():
-                if len(cluster_faces) >= self.min_cluster_size:
-                    # Compute cluster quality
-                    quality_score = self._compute_cluster_quality(
-                        cluster_faces,
-                        hybrid_similarities
-                    )
-                    
-                    if quality_score >= 0.75:  # Higher threshold for better precision
-                        representative_face = self._select_representative_face(cluster_faces)
-                        
-                        unique_people.append({
-                            "person_id": int(cluster_id),
-                            "instances_count": len(cluster_faces),
-                            "confidence_score": float(quality_score),
-                            "representative_face": {
-                                "filename": representative_face.filename,
-                                "face_image": representative_face.face_image,
-                                "confidence": float(representative_face.confidence)
-                            },
-                            "appearances": [
-                                {
-                                    "filename": face.filename,
-                                    "face_image": face.face_image,
-                                    "confidence": float(face.confidence),
-                                    "box": [float(x) for x in face.box]
-                                }
-                                for face in sorted(
-                                    cluster_faces,
-                                    key=lambda x: x.confidence,
-                                    reverse=True
-                                )
-                            ]
-                        })
-            
-            # Sort by quality and size
-            unique_people.sort(
-                key=lambda x: (x["confidence_score"], x["instances_count"]),
-                reverse=True
-            )
-            
-            return unique_people
-            
-        except Exception as e:
-            logger.error(f"Error in cluster_faces: {str(e)}")
-            return []
+            for idx, group in enumerate(verified_groups):
+                representative = max(group, key=lambda x: float(x.confidence))
+                avg_confidence = float(np.mean([face.confidence for face in group]))
 
-    def add_face(self, face_instance: FaceInstance) -> None:
-        """Add a face for clustering with enhanced features"""
-        if face_instance.confidence >= self.min_confidence:
-            try:
-                # Convert base64 to image for feature extraction
-                img_bytes = base64.b64decode(face_instance.face_image)
-                img_array = np.frombuffer(img_bytes, dtype=np.uint8)
-                face_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-                
-                # Extract facial features
-                facial_features = self._extract_facial_features(face_img)
-                if facial_features:
-                    face_instance.facial_features = facial_features
-                    self.face_instances.append(face_instance)
-                    self.embeddings.append(face_instance.embedding)
-                    
-            except Exception as e:
-                logger.error(f"Error adding face: {str(e)}")
+                unique_people.append({
+                    "person_id": idx,
+                    "instances_count": len(group),
+                    "confidence_score": avg_confidence,
+                    "representative_face": {
+                        "filename": representative.filename,
+                        "face_image": representative.face_image,
+                        "confidence": float(representative.confidence),
+                        "box": [float(x) for x in representative.box]
+                    },
+                    "appearances": [{
+                        "filename": face.filename,
+                        "face_image": face.face_image,
+                        "confidence": float(face.confidence),
+                        "box": [float(x) for x in face.box]
+                    } for face in group]
+                })
+
+            logger.info(f"Found {len(unique_people)} unique people after verification")
+            return unique_people
+
+        except Exception as e:
+            logger.error(f"Error in get_unique_people: {str(e)}")
+            logger.exception("Full traceback:")
+            return []
 
 def encode_image(img, quality=95):
     """Encode image with higher quality"""
@@ -641,7 +512,7 @@ def convert_to_degrees(gps_coords):
     s = float(gps_coords.values[2].num) / float(gps_coords.values[2].den)
     return d + (m / 60.0) + (s / 3600.0)
 
-def is_valid_detection(box, prob, img_shape, min_confidence=0.85):
+def is_valid_detection(box, prob, img_shape, min_confidence=0.9):
     """Optimized validation of face detections"""
     try:
         if prob < min_confidence:
@@ -809,14 +680,8 @@ async def analyze_folder():
                 if f.suffix.lower() in {'.png', '.jpg', '.jpeg'}
             ]
             
-            face_clusterer = EnhancedFaceClusterer(
-                min_face_size=160,
-                min_confidence=0.92,
-                similarity_threshold=0.7,
-                min_cluster_size=2
-            )
+            face_clusterer = RobustFaceClusterer()
             
-            # Process images
             for img_path in image_files:
                 result = await process_image(img_path, img_path.name)
                 if result and not result.get('error'):
@@ -825,25 +690,27 @@ async def analyze_folder():
                         result.get('face_images', [])
                     )):
                         try:
-                            face_instance = FaceInstance(
+                            # Convert base64 to image
+                            img_bytes = base64.b64decode(face_img)
+                            img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+                            face_image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                            
+                            face_clusterer.face_signatures.append(FaceSignature(
+                                embedding=face_data['embedding'],
                                 filename=img_path.name,
-                                face_index=idx,
-                                box=face_data['box'],
+                                face_image=face_img,
                                 confidence=face_data['confidence'],
-                                embedding=np.array(face_data['embedding']),
-                                face_image=face_img
-                            )
-                            face_clusterer.add_face(face_instance)
+                                box=face_data['box']
+                            ))
                         except Exception as e:
-                            logger.error(f"Error creating face instance: {str(e)}")
+                            logger.error(f"Error processing face: {str(e)}")
                     
                     yield json.dumps({
                         "type": "processing",
                         "result": result
                     }, ensure_ascii=False).strip() + "\n"
             
-            # Get unique people
-            unique_people = face_clusterer.cluster_faces()
+            unique_people = face_clusterer.get_unique_people()
             
             yield json.dumps({
                 "type": "unique_people",

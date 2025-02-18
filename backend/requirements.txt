@@ -6,14 +6,17 @@ python-multipart==0.0.9
 # Image processing
 Pillow==9.5.0
 opencv-python==4.8.1.78
-numpy==1.24.3
+numpy==1.23.5
 
 # Face detection
 torch==2.1.2
 torchvision==0.16.2
 facenet-pytorch==2.5.3
-face_recognition
-opencv-python
+scikit-learn==1.0.2
+face-recognition==1.3.0
+tensorflow==2.15.0
+keras==2.15.0
+deepface==0.0.79
 
 # Utilities
 python-jose==3.3.0
@@ -21,6 +24,4 @@ python-dotenv==1.0.0
 
 ExifRead==3.0.0
 piexif==1.1.3
-
-# New dependencies
-scikit-learn
+gdown
