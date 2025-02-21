@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.face-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 1rem;
+}
+
+.face-card {
+  @apply bg-gray-800 rounded-lg overflow-hidden transition-transform hover:scale-105;
+}
+
+.confidence-badge {
+  @apply absolute bottom-2 right-2 bg-black/50 px-2 py-1 rounded text-xs;
+}
+
+.image-container {
+  @apply relative aspect-square;
+}
+
+.full-image {
+  @apply rounded-lg object-cover w-full h-full;
+} 

@@ -1,72 +1,42 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
-# Dependencies
-node_modules/
-/.pnp
-.pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/versions
-
-# Testing
-/coverage
-.coverage
-htmlcov/
-.pytest_cache/
-
-# Build outputs
-/.next/
-/out/
-/build
-dist/
-*.egg-info/
-*.egg
-
-# Python
+# 🚀 Ignore Python Virtual Environments
+backend/venv/
 backend/.venv/
-backend/insightface_model/models/
-*.onnx
-*.zip
-venv/
-env/
-ENV/
+backend/.models
+backend/insightface_model
+backend/models
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
 
-# Environment variables
-.env*
-.env.local
-.env.*.local
+# 🚀 Ignore Node.js Dependencies
+frontend/node_modules/
+frontend/.next/
+npm-debug.log
 
-# Media and uploads
-backend/images/
-media/
-uploads/
-
-# IDE and OS files
-.DS_Store
-.idea/
-.vscode/
+# 🚀 Ignore Logs & Temp Files
+*.log
+*.out
+*.tmp
 *.swp
-*.swo
-*.pem
 
-# Debug logs
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
+# 🚀 Ignore Compiled Binaries
+*.exe
+*.dll
+*.o
+*.so
 
-# Vercel
-.vercel
+# 🚀 Ignore IDE & System Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 
-# TypeScript
-*.tsbuildinfo
-next-env.d.ts
+# 🚀 Ignore Large Files
+*.zip
+*.tar.gz
+*.rar
+*.mp4
+*.mov
 
-# Database
-*.db
-*.sqlite3
+# 🚀 Ignore Environment Files (Secrets)
+.env
+.env.local

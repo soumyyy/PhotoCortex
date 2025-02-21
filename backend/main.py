@@ -17,10 +17,14 @@ from dataclasses import dataclass, asdict
 import warnings
 import sys
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 from datetime import datetime
+import torch
+import torchvision.models as models
+from torchvision import transforms
+from ultralytics import YOLO
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 
@@ -70,15 +74,185 @@ class FaceClusterer:
     def __init__(self):
         """Initialize with suppressed stdout."""
         self.min_confidence = 0.6
+        logger.info("Initializing FaceClusterer...")
+        
+        # Initialize YOLO first
+        self.yolo_model = None
+        try:
+            model_path = './models/yolo_v8s/yolov8s.pt'
+            if os.path.exists(model_path):
+                # Suppress YOLO initialization messages
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.yolo_model = YOLO(model_path, verbose=False)
+        except Exception as e:
+            logger.error(f"Error loading YOLOv8 model: {str(e)}")
+        
+        # Initialize other models
         with redirect_stdout(io.StringIO()):
             self.app = FaceAnalysis(
                 name='buffalo_l',
-                root="./insightface_model",
+                root=".models/insightface_model",
                 providers=['CPUExecutionProvider']
             )
             self.app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.5)
+            self.load_indoor_outdoor_model()
 
-        logger.info("Model initialized.")
+        logger.info("All models initialized.")
+
+    def load_indoor_outdoor_model(self):
+        """Load Places365 model for scene classification."""
+        try:
+            # Load the model architecture (ResNet50)
+            self.scene_model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+            num_ftrs = self.scene_model.fc.in_features
+            self.scene_model.fc = torch.nn.Linear(num_ftrs, 365)  # Places365 has 365 categories
+            
+            # Load the Places365 weights
+            model_path = './models/indoor_outdoor_classifier/resnet50_places365.pth.tar'
+            if not os.path.exists(model_path):
+                logger.warning("Places365 model not found. Scene classification will be disabled.")
+                self.scene_model = None
+                return
+                
+            # Load Places365 checkpoint
+            checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+            state_dict = checkpoint['state_dict']
+            
+            # Remove the 'module.' prefix
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            
+            # Load all weights including fc layer
+            model_dict = self.scene_model.state_dict()
+            model_dict.update(state_dict)
+            self.scene_model.load_state_dict(model_dict)
+            
+            # Verify model configuration
+            logger.info(f"FC layer output features: {self.scene_model.fc.out_features}")
+            logger.info(f"Sample model layers: {list(state_dict.keys())[:5]}")
+            
+            # Define broader ranges for indoor/outdoor in Places365
+            # Expanding ranges to catch more categories
+            self.indoor_ranges = [(0, 150)]  # First 150 categories are typically indoor
+            self.outdoor_ranges = [(250, 365)]  # Last 115 categories are typically outdoor
+            
+            # These are just for logging
+            self.categories = [f"category_{i}" for i in range(365)]
+            self.indoor_indices = [i for start, end in self.indoor_ranges for i in range(start, end)]
+            self.outdoor_indices = [i for start, end in self.outdoor_ranges for i in range(start, end)]
+            
+            logger.info(f"Loaded {len(self.categories)} categories")
+            logger.info(f"Indoor categories: {len(self.indoor_indices)}, Outdoor categories: {len(self.outdoor_indices)}")
+            
+            # Define image preprocessing pipeline
+            self.scene_transforms = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize(256),  # Resize shorter side to 256
+                transforms.CenterCrop(224),  # Center crop to 224x224
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+            
+            # Set model to eval mode
+            self.scene_model.eval()
+            
+            # Define image transforms
+            self.scene_transforms = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+            
+            logger.info("Indoor/outdoor classification model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading indoor/outdoor model: {e}")
+            self.scene_model = None
+
+    def predict_indoor_outdoor(self, image_bytes):
+        """Predict whether an image is indoor or outdoor using Places365 categories."""
+        if self.scene_model is None:
+            return {
+                "scene_type": "unknown",
+                "confidence": 0.0,
+                "probabilities": {
+                    "indoor": 0.0,
+                    "outdoor": 0.0
+                }
+            }
+            
+        try:
+            # Convert image bytes to numpy array
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Prepare image for model
+            input_tensor = self.scene_transforms(img)
+            input_batch = input_tensor.unsqueeze(0)
+            
+            # Get model prediction
+            with torch.no_grad():
+                output = self.scene_model(input_batch)
+                probabilities = torch.nn.functional.softmax(output, dim=1)[0]
+                
+                # Get predictions but don't log them
+                top5_values, top5_indices = torch.topk(probabilities, 5)
+                
+                # Map Places365 predictions to our categories
+                category_probs = {}
+                for i in range(len(probabilities)):
+                    prob = probabilities[i].item()
+                    if prob > 0.01:  # Only consider probabilities > 1%
+                        category_probs[i] = prob
+                
+                # Calculate weighted indoor/outdoor probabilities
+                indoor_prob = 0.0
+                outdoor_prob = 0.0
+                total_weight = 0.0
+                
+                # Common indoor/outdoor keywords in Places365
+                indoor_keywords = ['room', 'indoor', 'inside', 'interior', 'bedroom', 'kitchen', 'office', 'bathroom']
+                outdoor_keywords = ['outdoor', 'outside', 'field', 'sky', 'mountain', 'forest', 'street', 'beach']
+                
+                # Process each prediction
+                for idx, prob in category_probs.items():
+                    # Get the raw Places365 category name (even if we don't have it mapped)
+                    category_name = f"category_{idx}"
+                    
+                    # Determine if it's indoor/outdoor based on index patterns in Places365
+                    # Using broader ranges and higher weights
+                    if idx < 150:  # Indoor categories
+                        weight = 1.0 if idx < 100 else 0.8  # Higher weight for more confident categories
+                        indoor_prob += prob * weight
+                        total_weight += weight
+                    elif idx > 250:  # Outdoor categories
+                        weight = 1.0 if idx > 300 else 0.8  # Higher weight for more confident categories
+                        outdoor_prob += prob * weight
+                        total_weight += weight
+                
+                # Convert to percentages and normalize
+                if total_weight > 0:
+                    indoor_prob = (indoor_prob / total_weight) * 100
+                    outdoor_prob = (outdoor_prob / total_weight) * 100
+                else:
+                    indoor_prob = outdoor_prob = 0  # No confident predictions
+                
+                # Always show the most likely prediction
+                if indoor_prob > outdoor_prob:
+                    scene_type = "indoor"
+                    confidence = indoor_prob
+                else:
+                    scene_type = "outdoor"
+                    confidence = outdoor_prob
+                
+            prediction = {
+                "scene_type": scene_type
+            }
+            
+            return prediction
+        except Exception as e:
+            logger.error(f"Error in scene prediction: {e}")
+            return {"error": str(e)}
 
     def _validate_face(self, face_img: np.ndarray) -> bool:
         """Validate face aspect ratio."""
@@ -198,7 +372,7 @@ class FaceClusterer:
         return d + (m / 60.0) + (s / 3600.0)
 
     def process_image(self, image_path: Path) -> Optional[Dict[str, Any]]:
-        """Process a single image using InsightFace, keep BGR for output."""
+        """Process a single image using InsightFace and YOLOv8, keep BGR for output."""
         try:
             image = cv2.imread(str(image_path))
             if image is None:
@@ -206,6 +380,13 @@ class FaceClusterer:
                 return None
 
             metadata = self.extract_metadata(image_path)
+
+            # Read image bytes for indoor/outdoor classification
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            # Get indoor/outdoor classification
+            scene_info = self.predict_indoor_outdoor(image_bytes)
 
             # Possibly resize if very large
             original_img = image.copy()
@@ -231,6 +412,25 @@ class FaceClusterer:
                             'face_image': face_image
                         })
 
+            # Run YOLOv8 object detection
+            object_detections = set()  # Using set to avoid duplicates
+            if self.yolo_model is not None:
+                try:
+                    # Suppress all YOLO output
+                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        yolo_results = self.yolo_model(resized_img, verbose=False)
+                    for result in yolo_results:
+                        boxes = result.boxes
+                        for box, conf, cls in zip(boxes.xyxy, boxes.conf, boxes.cls):
+                            class_name = result.names[int(cls)]
+                            # Skip person class and only include high confidence detections
+                            if class_name != 'person' and float(conf) > 0.3:
+                                object_detections.add(class_name)
+                    # Convert set to sorted list
+                    object_detections = sorted(list(object_detections))
+                except Exception as e:
+                    logger.error(f"Error in YOLOv8 detection: {e}")
+
             # Encode the full (original) image in BGR → JPEG
             success, buffer = cv2.imencode('.jpg', original_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
             if not success:
@@ -238,11 +438,19 @@ class FaceClusterer:
 
             full_image_base64 = base64.b64encode(buffer).decode('utf-8')
 
+            # Create info string for frontend
+            scene_type = scene_info.get('scene_type', 'unknown')
+            objects_str = ', '.join(object_detections) if object_detections else 'none'
+            info_str = f"Scene: {scene_type}, Objects: {objects_str}"
+
             return {
                 'filename': str(image_path.name),
                 'faces': results,
                 'full_image': f"data:image/jpeg;base64,{full_image_base64}",
-                'metadata': metadata
+                'metadata': metadata,
+                'scene_classification': {'scene_type': scene_type},
+                'object_detections': object_detections,
+                'info': info_str
             }
         except Exception as e:
             logger.error(f"Error processing {image_path.name}: {e}")
